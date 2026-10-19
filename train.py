@@ -20,6 +20,11 @@ parser.add_argument('--pbar', action='store_true', help='whether to add a progre
 parser.add_argument('--profile', action='store_true', help='whether to profile')
 parser.add_argument('--partial_eval', action='store_true', help='whether to perform validation and test on partial dataset')
 parser.add_argument('--partial_eval_interval', type=int, default=2000, help='how often to perform partial evaluation during training')
+parser.add_argument('--tgb_strict', action='store_true', help='with --tgb_eval: use the eval minibatches from gen_minibatch.py --tgb_strict')
+parser.add_argument('--tgb_eval', action='store_true', help='TGB-style val/test with fixed negatives (needs gen_minibatch.py --tgb_eval)')
+parser.add_argument('--epochs', type=int, default=0, help='override the number of epochs (0 = get_config default)')
+parser.add_argument('--eval_every', type=int, default=1, help='validate every N epochs (the last epoch is always validated)')
+parser.add_argument('--no_static_memory', action='store_true', help='drop node features (DistTGL static memory = learned_node_feats.pt), i.e. plain TGN memory')
 args = parser.parse_args()
 
 if args.data in ['GDELT', 'LINK']:
@@ -78,7 +83,7 @@ if local_rank == 0:
         log_dir = str(Path(args.log).parent)
         if not os.path.isdir(log_dir):
             os.makedirs(log_dir)
-        log_f = open(args.log, 'w')
+        log_f = open(args.log, 'w', buffering=1)
 
 if global_rank == 0:
     if not os.path.isdir('models'):
@@ -95,6 +100,10 @@ profile_path_saver = profile_path_saver[0]
 
 if local_rank == 0:
     _node_feats, _edge_feats = load_feat(args.data)
+    if args.no_static_memory:
+        # DistTGL's static memory is the pre-trained node embedding table, added to
+        # the dynamic memory in SmartMemoryUpdater; without it the model is TGN.
+        _node_feats = None
 dim_feats = [0, 0, 0, 0, 0, 0, 0, 0]
 if local_rank == 0:
     if _node_feats is not None:
@@ -130,6 +139,8 @@ if local_rank > 0:
 sample_param, memory_param, gnn_param, train_param = get_config(args.data, tot_rank, minibatch_parallelism=args.minibatch_parallelism)
 if args.train_neg_samples > 0:
     train_param['train_neg_samples'] = args.train_neg_samples
+if args.epochs > 0:
+    train_param['epoch'] = args.epochs
 if args.batchsize > 0:
     train_param['lr'] = train_param['lr'] * args.batchsize / train_param['batch_size']
     train_param['batch_size'] = args.batchsize
@@ -175,7 +186,7 @@ if memory_param['type'] != 'none':
         read_status.zero_()
         write_status.zero_()
         reset_status.zero_()
-        mailbox_daemon = Process(target=start_mailbox_daemon, args=(args.omp_num_threads, group_id, dims_mailbox, args.edge_classification))
+        mailbox_daemon = Process(target=start_mailbox_daemon, args=(args.omp_num_threads, group_id, dims_mailbox, args.edge_classification), daemon=True)
         mailbox_daemon.start()
         torch.distributed.barrier()
     else:
@@ -216,8 +227,12 @@ else:
     raise TypeError
 
 train_dataloader = DataLoader(args.data, train_param['train_neg_samples'], train_param['eval_neg_samples'], args.neg_sets, 'train', minibatch_parallelism=args.minibatch_parallelism, mailbox=mailbox, node_feats=node_feats, edge_feats=edge_feats, edge_classification=args.edge_classification)
-val_dataloader = DataLoader(args.data, train_param['train_neg_samples'], train_param['eval_neg_samples'], args.neg_sets, 'val', edge_classification=args.edge_classification)
-test_dataloader = DataLoader(args.data, train_param['train_neg_samples'], train_param['eval_neg_samples'], args.neg_sets, 'test', edge_classification=args.edge_classification)
+if not args.tgb_eval:
+    val_dataloader = DataLoader(args.data, train_param['train_neg_samples'], train_param['eval_neg_samples'], args.neg_sets, 'val', edge_classification=args.edge_classification)
+    test_dataloader = DataLoader(args.data, train_param['train_neg_samples'], train_param['eval_neg_samples'], args.neg_sets, 'test', edge_classification=args.edge_classification)
+else:
+    val_dataloader = None
+    test_dataloader = None
 
 def eval(mode='val', pos_only=False):
     model.eval()
@@ -289,6 +304,52 @@ def eval(mode='val', pos_only=False):
         ap = 0
         mrr = 0
     return total_loss, ap, mrr, f1mic
+
+def eval_tgb(mode='val'):
+    # TGB-style evaluation (see gen_minibatch.py --tgb_eval): every edge is ranked
+    # against TGB's fixed negatives and MRR uses TGB's formula (mean of the
+    # optimistic and pessimistic rank). Memory is ingested once per eval batch,
+    # after all of that batch's edges are scored, as in eval(). Returns the same
+    # tuple as eval(); loss and AP are not computed (reported as 0).
+    model.eval()
+    path = 'minibatches/{}_tgb_eval{}/'.format(args.data, '_strict' if args.tgb_strict else '')
+    with open(path + 'meta.pkl', 'rb') as f:
+        num_chunks = pickle.load(f)[mode]
+    if args.pbar:
+        eval_pbar = tqdm(total=sum(num_chunks), position=1)
+    mrrs = list()
+    with torch.no_grad():
+        for i, n in enumerate(num_chunks):
+            for k in range(n):
+                with open('{}{}_pos_{}_{}.pkl'.format(path, mode, i, k), 'rb') as f:
+                    pos_mfg = pickle.load(f)
+                with open('{}{}_neg_{}_{}.pkl'.format(path, mode, i, k), 'rb') as f:
+                    neg_mfg = pickle.load(f)
+                neg_cnt = neg_mfg.neg_cnt
+                mfg = combine_mfgs(pos_mfg, neg_mfg)
+                mailbox.prep_input_mails(mfg)
+                prepare_input(mfg, node_feats, edge_feats)
+                mfg = mfg_to_cuda(mfg)
+                pred_pos, pred_neg = model(mfg)
+                y_pos = pred_pos.reshape(-1, 1)
+                y_neg = pred_neg.reshape(-1, y_pos.shape[0]).T
+                pad = torch.arange(y_neg.shape[1], device=y_neg.device)[None, :] >= neg_cnt.to(y_neg.device)[:, None]
+                y_neg = y_neg.masked_fill(pad, float('-inf'))
+                rank = 0.5 * ((y_neg > y_pos).sum(dim=1) + (y_neg >= y_pos).sum(dim=1)) + 1
+                mrrs.append((1. / rank).cpu())
+                if args.pbar:
+                    eval_pbar.update(1)
+            with open('{}{}_pos_{}.pkl'.format(path, mode, i), 'rb') as f:
+                pos_mfg = pickle.load(f)
+            pos_mfg.combined = False
+            mailbox.prep_input_mails(pos_mfg)
+            prepare_input(pos_mfg, node_feats, edge_feats)
+            pos_mfg = mfg_to_cuda(pos_mfg)
+            model(pos_mfg)
+            mailbox.update_memory_and_mailbox(pos_mfg, model.module.memory_updater.last_updated_memory)
+    return 0, 0, float(torch.cat(mrrs).mean()), 0
+
+run_eval = eval_tgb if args.tgb_eval else eval
 
 def partial_eval(mode='val', start_batch=3000, tot_length=500, prologue_length=100):
     model.eval()
@@ -519,14 +580,18 @@ with torch.profiler.profile(
             if args.log != '':
                 log_f.write('\ttrain loss:{:.4f}  train time:{:.2f}\n'.format(train_loss, train_time))
                 log_f.write('\tt_prep1:{:.2f} t_prep2:{:.2f} t_compute:{:.2f} t_writeback:{:.2f}\n'.format(t_prep1, t_prep2, t_comput, t_writeback))
-        if not args.partial_eval:
+        if not args.partial_eval and ((e + 1) % args.eval_every == 0 or e == train_param['epoch'] - 1):
             if global_rank == 0:
-                eval_loss, eval_ap, eval_mrr, eval_f1mic = eval('val')
+                t_eval = time.time()
+                eval_loss, eval_ap, eval_mrr, eval_f1mic = run_eval('val')
+                t_eval = time.time() - t_eval
                 if not args.edge_classification:
                     print('\tval loss:{:.4f}    val mrr:{:.4f}    val_ap:{:.4f}'.format(eval_loss, eval_mrr, eval_ap))
                 else:
                     print('\tval loss:{:.4f}    val f1mic:{:.4f}'.format(eval_loss, eval_f1mic))
+                print('\tval time:{:.2f}'.format(t_eval))
                 if args.log != '':
+                    log_f.write('\tval time:{:.2f}\n'.format(t_eval))
                     if not args.edge_classification:
                         log_f.write('\tval loss:{:.4f}    val mrr:{:.4f}    val_ap:{:.4f}\n'.format(eval_loss, eval_mrr, eval_ap))
                     else:
@@ -536,7 +601,7 @@ with torch.profiler.profile(
                     best_e = e
                     best_metric = curr_metric
                     torch.save(model.state_dict(), path_saver)
-                    _, test_ap, test_mrr, test_f1mic = eval('test')
+                    _, test_ap, test_mrr, test_f1mic = run_eval('test')
                     print('\ttest AP:{:4f}  test MRR:{:4f}'.format(test_ap, test_mrr))
     
 if group_rank == 0:

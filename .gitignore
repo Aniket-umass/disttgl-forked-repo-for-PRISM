@@ -1,0 +1,12 @@
+DATA/
+__pycache__/
+build/
+logs/
+minibatches/
+models/
+results/
+runs/
+*.so
+*.bak
+*.pre_*
+*.orig

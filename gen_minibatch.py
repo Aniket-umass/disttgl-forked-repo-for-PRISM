@@ -10,6 +10,12 @@ parser.add_argument('--gen_eval', action='store_true', help='whether to generate
 parser.add_argument('--eval_cap', type=int, default=0, help='maximum number of minibatches in eval and test set')
 parser.add_argument('--minibatch_parallelism', type=int, default=1, help='how many nubmer of GPU per minibatches')
 parser.add_argument('--edge_classification', action='store_true', help='whether to train with the edge classification task')
+parser.add_argument('--batchsize', type=int, default=0, help='training batch size (0 = get_config default)')
+parser.add_argument('--eval_batchsize', type=int, default=0, help='val/test batch size (0 = get_config default)')
+parser.add_argument('--tgb_eval', action='store_true', help='TGB-style val/test: rank each edge against TGB fixed negatives (DATA/<data>/tgb_raw.npz)')
+parser.add_argument('--tgb_strict', action='store_true', help='with --tgb_eval: neighbours of a val/test edge are limited to edges before its eval batch, as TGB updates its neighbour store once per batch; writes <data>_tgb_eval_strict')
+parser.add_argument('--eval_chunk', type=int, default=32, help='with --tgb_eval: edges scored per chunk (each with ~1000 negatives)')
+parser.add_argument('--bipartite', type=int, default=-1, help='1/0 to force bipartite negative sampling, -1 = decide by dataset name')
 args = parser.parse_args()
 
 if args.data in ['GDELT', 'LINK']:
@@ -46,6 +52,9 @@ tot_rank = 1
 sample_param, memory_param, gnn_param, train_param = get_config(args.data, tot_rank)
 if args.train_neg_samples > 0:
     train_param['train_neg_samples'] = args.train_neg_samples
+eval_batch_size = args.eval_batchsize if args.eval_batchsize > 0 else train_param['batch_size']
+if args.batchsize > 0:
+    train_param['batch_size'] = args.batchsize
 
 if args.edge_classification:
     args.neg_sets = 0
@@ -62,7 +71,9 @@ sampler = ParallelSampler(g['indptr'], g['indices'], g['eid'], g['ts'].astype(np
                             sample_param['num_thread'], 1, sample_param['layer'], sample_param['neighbor'],
                             sample_param['strategy']=='recent', sample_param['prop_time'],
                             sample_param['history'], float(sample_param['duration']))
-is_bipartite = True if args.data in ['WIKI', 'REDDIT', 'MOOC', 'LASTFM', 'Taobao', 'sTaobao', 'LINK'] else False
+is_bipartite = True if args.data in ['WIKI', 'REDDIT', 'MOOC', 'LASTFM', 'Taobao', 'sTaobao', 'LINK', 'tgbl-wiki', 'tgbl-review'] else False
+if args.bipartite >= 0:
+    is_bipartite = bool(args.bipartite)
 if is_bipartite:
     neg_link_sampler = NegLinkSampler(num_nodes, df=df)
 else:
@@ -200,7 +211,7 @@ for _, rows in tqdm(train_df.groupby(train_df.index // train_param['batch_size']
     i += 1
 
 
-if args.gen_eval:
+if args.gen_eval and not args.tgb_eval:
     path = 'minibatches/{}_{}_eval/'.format(args.data, train_param['eval_neg_samples'])
     if not os.path.isdir(path):
         os.mkdir(path)
@@ -208,7 +219,7 @@ if args.gen_eval:
     # validation
     last_updated_mem = None
     i = 0
-    for _, rows in tqdm(val_df.groupby(val_df.index // train_param['batch_size']), total=len(val_df) // train_param['batch_size']):
+    for _, rows in tqdm(val_df.groupby(val_df.index // eval_batch_size), total=len(val_df) // eval_batch_size):
         # positive mfg
         root_nodes = np.concatenate([rows.src.values, rows.dst.values]).astype(np.int32)
         ts = np.tile(rows.time.values, 2).astype(np.float32)
@@ -274,7 +285,7 @@ if args.gen_eval:
     # test
     last_updated_mem = None
     i = 0
-    for _, rows in tqdm(test_df.groupby(test_df.index // train_param['batch_size']), total=len(test_df) // train_param['batch_size']):
+    for _, rows in tqdm(test_df.groupby(test_df.index // eval_batch_size), total=len(test_df) // eval_batch_size):
         # positive mfg
         root_nodes = np.concatenate([rows.src.values, rows.dst.values]).astype(np.int32)
         ts = np.tile(rows.time.values, 2).astype(np.float32)
@@ -336,3 +347,100 @@ if args.gen_eval:
         if args.eval_cap > 0:
             if i > args.eval_cap:
                 break
+
+
+def sample_eval_mfg(root_nodes, ts, cutoff=None):
+    # one-hop block for root_nodes at times ts, carrying the memory/mail
+    # timestamps of the current state (i.e. before the current batch is ingested).
+    # cutoff: only edges strictly before cutoff are neighbours; time deltas stay
+    # relative to each query's own time ts
+    sampler.sample(root_nodes, ts if cutoff is None else np.full_like(ts, cutoff))
+    ret = sampler.get_ret()
+    mfg = to_dgl_blocks(ret, sample_param['history'], 0, cuda=False)[0][0]
+    if cutoff is not None:
+        shift = torch.from_numpy(ts - cutoff)
+        mfg.edata['dt'] = mfg.edata['dt'] + shift[mfg.edges()[1].long()].to(mfg.edata['dt'].dtype)
+    mfg.srcdata['ID'] = mfg.srcdata['ID'].long()
+    mfg.srcdata['mem_ts'] = mem_ts[mfg.srcdata['ID']]
+    mfg.srcdata['mail_ts'] = mail_ts[mfg.srcdata['ID']]
+    mfg.srcdata['mail_e'] = mail_e[mfg.srcdata['ID']]
+    return mfg
+
+if args.gen_eval and args.tgb_eval:
+    # TGB-style evaluation: every val/test edge is ranked against TGB's fixed
+    # negatives (tgb_raw.npz, written by tgb_export.py). Memory is still ingested
+    # in batches of eval_batch_size edges ({split}_pos_<i>.pkl, used only for the
+    # memory update). Scoring is split into chunks of eval_chunk edges
+    # ({split}_{pos,neg}_<i>_<k>.pkl) so ~1000 negatives per edge fit on the GPU;
+    # every chunk of batch i sees the same pre-batch state, so the scores equal
+    # those of scoring the whole batch at once.
+    tgb = np.load('DATA/{}/tgb_raw.npz'.format(args.data))
+    path = 'minibatches/{}_tgb_eval{}/'.format(args.data, '_strict' if args.tgb_strict else '')
+    if not os.path.isdir(path):
+        os.mkdir(path)
+    meta = {'eval_batch_size': eval_batch_size, 'eval_chunk': args.eval_chunk}
+    for split, split_df in (('val', val_df), ('test', test_df)):
+        negs = tgb[split + '_neg']
+        cnts = tgb[split + '_cnt']
+        assert negs.shape[0] == len(split_df), (split, negs.shape, len(split_df))
+        first = split_df.index[0]
+        num_chunks = list()
+        for i, (_, rows) in enumerate(tqdm(split_df.groupby(split_df.index // eval_batch_size), total=len(split_df) // eval_batch_size)):
+            cutoff = np.float32(rows.time.values.min()) if args.tgb_strict else None
+            # positive block of the whole batch (memory update)
+            root_nodes = np.concatenate([rows.src.values, rows.dst.values]).astype(np.int32)
+            ts = np.tile(rows.time.values, 2).astype(np.float32)
+            mfg = sample_eval_mfg(root_nodes, ts, cutoff)
+
+            src = torch.from_numpy(rows.src.values)
+            dst = torch.from_numpy(rows.dst.values)
+            ts = torch.from_numpy(ts)
+            eid = torch.from_numpy(rows.index.values)
+            mailseid = torch.cat([eid, eid])
+            mailsts = ts
+            nid = torch.cat([src.unsqueeze(1), dst.unsqueeze(1)], dim=1).reshape(-1)
+            update_mask = torch.zeros(nid.shape[0], dtype=torch.bool)
+            idx = unique_last_idx(nid)
+            nid = torch.cat([src, dst])
+            idx_map = torch.cat([torch.arange(src.shape[0]).unsqueeze(1), torch.arange(dst.shape[0]).unsqueeze(1) + src.shape[0]], dim=1).reshape(-1)
+            idx = idx_map[idx]
+            update_mask[idx] = 1
+            mfg.node_memory_mask = update_mask
+            mfg.start_eidx = eid[0].item()
+            mfg.end_eidx = eid[-1].item() + 1
+            with open('{}/{}_pos_{}.pkl'.format(path, split, i), 'wb') as f:
+                pickle.dump(mfg, f)
+
+            # scoring chunks: positives plus their fixed negatives, laid out as
+            # [negative 0 of every edge, negative 1 of every edge, ...] to match
+            # EdgePredictor's tiling of the source embeddings
+            k = 0
+            for c0 in range(0, len(rows), args.eval_chunk):
+                crows = rows.iloc[c0:c0 + args.eval_chunk]
+                c_root = np.concatenate([crows.src.values, crows.dst.values]).astype(np.int32)
+                c_ts = np.tile(crows.time.values, 2).astype(np.float32)
+                pos_mfg = sample_eval_mfg(c_root, c_ts, cutoff)
+                pos_mfg.node_memory_mask = torch.zeros(c_root.shape[0], dtype=torch.bool)
+                ni = crows.index.values - first
+                neg = negs[ni]
+                neg_root = np.ascontiguousarray(neg.T).reshape(-1).astype(np.int32)
+                neg_ts = np.tile(crows.time.values, neg.shape[1]).astype(np.float32)
+                neg_mfg = sample_eval_mfg(neg_root, neg_ts, cutoff)
+                neg_mfg.neg_cnt = torch.from_numpy(cnts[ni])
+                with open('{}/{}_pos_{}_{}.pkl'.format(path, split, i, k), 'wb') as f:
+                    pickle.dump(pos_mfg, f)
+                with open('{}/{}_neg_{}_{}.pkl'.format(path, split, i, k), 'wb') as f:
+                    pickle.dump(neg_mfg, f)
+                k += 1
+            num_chunks.append(k)
+
+            # update mem_ts, mail_ts, and mail_e
+            nid = nid[idx].long()
+            mailseid = mailseid[idx]
+            mailsts = mailsts[idx]
+            mem_ts[nid] = mail_ts[nid]
+            mail_ts[nid] = mailsts
+            mail_e[nid] = mailseid
+        meta[split] = num_chunks
+    with open('{}/meta.pkl'.format(path), 'wb') as f:
+        pickle.dump(meta, f)

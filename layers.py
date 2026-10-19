@@ -3,6 +3,11 @@ import dgl
 import math
 import numpy as np
 
+# In eval mode, blocks with more edges than this go through the attention layer
+# in chunks of destination nodes (same result, bounded GPU memory). Needed when
+# the eval batch size is large (e.g. 8192 edges x 49 negatives on an 11 GB GPU).
+EVAL_CHUNK_EDGES = 500000
+
 class TimeEncode(torch.nn.Module):
 
     def __init__(self, dim):
@@ -75,7 +80,62 @@ class TransfomerAttentionLayer(torch.nn.Module):
         self.w_out = torch.nn.Linear(dim_node_feat + dim_out, dim_out)
         self.layer_norm = torch.nn.LayerNorm(dim_out)
 
+    def _forward_chunked(self, b, chunk_edges):
+        # Same computation as forward(), but K/V/attention are built for a slice of
+        # destination nodes at a time instead of for every edge at once.
+        device = b.src_idx_cuda.device
+        h = b.srcdata['h']
+        idx = b.src_idx_cuda
+        n_dst = b.num_dst_nodes()
+        if b.combined:
+            q_idx = torch.cat([idx[:b.num_pos_dst], idx[b.num_pos_idx:b.num_pos_idx + b.num_neg_dst]], dim=0)
+            kv_idx = torch.cat([idx[b.num_pos_dst:b.num_pos_idx], idx[b.num_pos_idx + b.num_neg_dst:]], dim=0)
+        else:
+            q_idx = idx[:n_dst]
+            kv_idx = idx[n_dst:]
+        q_data = h[q_idx]
+        zero_time_feat = self.time_enc(torch.zeros(n_dst, dtype=torch.float32, device=device))
+        Qn = self.w_q(torch.cat([q_data, zero_time_feat], dim=1))
+        row = b.edges()[1]
+        row_s, order = torch.sort(row)
+        num_e = row_s.shape[0]
+        agg = torch.zeros((n_dst, self.dim_out), device=device)
+        start = 0
+        while start < num_e:
+            end = min(start + chunk_edges, num_e)
+            if end < num_e:
+                # never split one destination node's edges across chunks
+                end = int(torch.searchsorted(row_s, row_s[end - 1], right=True))
+            e = order[start:end]
+            r = row_s[start:end]
+            d0 = int(r[0])
+            d1 = int(r[-1]) + 1
+            time_feat = self.time_enc(b.edata['dt'][e])
+            if self.dim_edge_feat == 0:
+                kv = torch.cat([h[kv_idx[e]], time_feat], dim=1)
+            else:
+                kv = torch.cat([h[kv_idx[e]], b.edata['f'][e], time_feat], dim=1)
+            Q = Qn[r]
+            K = self.w_k(kv)
+            V = self.w_v(kv)
+            del kv
+            Q = torch.reshape(Q, (Q.shape[0], self.num_head, -1))
+            K = torch.reshape(K, (K.shape[0], self.num_head, -1))
+            V = torch.reshape(V, (V.shape[0], self.num_head, -1))
+            g = dgl.create_block((torch.arange(end - start, device=device), r - d0), num_src_nodes=end - start, num_dst_nodes=d1 - d0)
+            att = dgl.ops.edge_softmax(g, self.att_act(torch.sum(Q*K, dim=2)))
+            att = self.att_dropout(att)
+            V = torch.reshape(V*att[:, :, None], (V.shape[0], -1))
+            agg[d0:d1] += dgl.ops.copy_e_sum(g, V)
+            start = end
+        rst = torch.cat([agg, q_data], dim=1)
+        rst = self.w_out(rst)
+        rst = torch.nn.functional.relu(self.dropout(rst))
+        return self.layer_norm(rst)
+
     def forward(self, b):
+        if (not self.training) and (not self.combined) and self.dim_time > 0 and b.num_edges() > EVAL_CHUNK_EDGES:
+            return self._forward_chunked(b, EVAL_CHUNK_EDGES)
         if self.dim_time > 0:
             time_feat = self.time_enc(b.edata['dt'])
             zero_time_feat = self.time_enc(torch.zeros(b.num_dst_nodes(), dtype=torch.float32, device=b.src_idx_cuda.device))
